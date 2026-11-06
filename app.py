@@ -3,10 +3,11 @@ import sys
 import re
 import json
 import base64
+import tempfile
+import shutil
 import types as _py_types
 import streamlit as st
 import streamlit.components.v1 as components
-import pdfkit
 
 # =====================================================================
 # [핵심] PyMuPDF 부가 플러그인 충돌 원천 차단
@@ -330,6 +331,7 @@ def extract_figures_from_page_render(page: fitz.Page, page_num: int, xref_counts
         results.append({
             "id": img_id,
             "fig_num": fnum,
+            "png_bytes": png_bytes,
             "data_uri": f"data:image/png;base64,{b64_str}",
             "width": pix.width,
             "height": pix.height,
@@ -337,6 +339,7 @@ def extract_figures_from_page_render(page: fitz.Page, page_num: int, xref_counts
         })
 
     return results, next_auto_fig
+
 
 def extract_text_and_figures_from_bytes(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -420,23 +423,48 @@ def summarize_with_gemini(client: genai.Client, model_chain: list[str], extracte
 
 
 # =====================================================================
-# 5. HTML 템플릿 렌더링
+# 5. HTML 템플릿 렌더링 및 PyMuPDF 자체 A4 PDF 생성 엔진
 # =====================================================================
-def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], descriptions: list[str], is_pdf: bool = False) -> str:
+def resolve_figure_images(summary: PaperSummaryResult, extracted_images: dict) -> list[tuple[FigureSummary, list[dict]]]:
+    fig_num_map = {}
+    for img_id, item in extracted_images.items():
+        fnum = item.get("fig_num")
+        if fnum is not None:
+            fig_num_map.setdefault(fnum, []).append(img_id)
+
+    resolved = []
+    used_img_ids = set()
+    for fig in summary.figures:
+        valid_img_objs = []
+        for raw_id in fig.image_ids:
+            clean_id = raw_id.split("(")[0].strip()
+            if clean_id in extracted_images and clean_id not in used_img_ids:
+                used_img_ids.add(clean_id)
+                valid_img_objs.append(extracted_images[clean_id])
+
+        if not valid_img_objs:
+            m_num = re.search(r"(\d+)", fig.figure_number)
+            if m_num:
+                fnum = int(m_num.group(1))
+                for cid in fig_num_map.get(fnum, []):
+                    if cid not in used_img_ids:
+                        used_img_ids.add(cid)
+                        valid_img_objs.append(extracted_images[cid])
+
+        resolved.append((fig, valid_img_objs))
+    return resolved
+
+
+def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], descriptions: list[str]) -> str:
     clean_num = fig_num.strip().rstrip(":")
     clean_diag = diagnosis.strip()
     header_html = f"{clean_num} : <span class='diag-highlight'>{clean_diag}</span>" if clean_diag else clean_num
     desc_items_html = "".join(f"<li>{d}</li>" for d in descriptions)
     count = len(img_objs)
-    
-    # PDF 생성 시에는 너무 큰 여백을 줄이고 사진 크기를 살짝 축소하여 페이지 넘김 개선
-    max_h_single = "580px" if is_pdf else "680px"
-    max_h_grid = "450px" if is_pdf else "540px"
-    margin_bottom = "10px" if is_pdf else "14px"
 
     if count == 0:
         return f"""
-        <div class="figure-card" style="margin-bottom: {margin_bottom};">
+        <div class="figure-card">
             <div class="figure-title">{header_html}</div>
             <ul class="figure-desc">{desc_items_html}</ul>
         </div>
@@ -445,11 +473,11 @@ def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], 
     if count == 1 and img_objs[0]["aspect"] <= 0.85:
         tall_img = img_objs[0]
         return f"""
-        <div class="figure-card" style="margin-bottom: {margin_bottom};">
+        <div class="figure-card">
             <div class="figure-title">{header_html}</div>
             <div class="side-by-side-table">
                 <div class="side-img-col">
-                    <img src="{tall_img['data_uri']}" class="tall-single-img" style="max-height: {max_h_single};" />
+                    <img src="{tall_img['data_uri']}" class="tall-single-img" />
                 </div>
                 <div class="side-desc-col">
                     <ul class="figure-desc side-desc">{desc_items_html}</ul>
@@ -461,10 +489,10 @@ def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], 
     if count == 1:
         single_img = img_objs[0]
         return f"""
-        <div class="figure-card" style="margin-bottom: {margin_bottom};">
+        <div class="figure-card">
             <div class="figure-title">{header_html}</div>
             <div class="full-width-img-box">
-                <img src="{single_img['data_uri']}" class="full-width-img" style="max-height: {max_h_single};" />
+                <img src="{single_img['data_uri']}" class="full-width-img" />
             </div>
             <ul class="figure-desc">{desc_items_html}</ul>
         </div>
@@ -473,11 +501,11 @@ def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], 
     cols = 2 if count in (2, 4) or any(i["aspect"] >= 1.3 for i in img_objs) else 3
     width_pct = {2: "49.4%", 3: "32.6%"}[cols]
     cells_html = "".join(
-        f'<div class="fig-cell" style="width: {width_pct};"><img src="{item["data_uri"]}" class="grid-fill-img" style="max-height: {max_h_grid};" /></div>'
+        f'<div class="fig-cell" style="width: {width_pct};"><img src="{item["data_uri"]}" class="grid-fill-img" /></div>'
         for item in img_objs
     )
     return f"""
-    <div class="figure-card" style="margin-bottom: {margin_bottom};">
+    <div class="figure-card">
         <div class="figure-title">{header_html}</div>
         <div class="figure-grid">{cells_html}</div>
         <ul class="figure-desc">{desc_items_html}</ul>
@@ -485,7 +513,7 @@ def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], 
     """
 
 
-def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict, is_pdf: bool = False) -> str:
+def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict) -> str:
     def render_list(items):
         return "".join(f"<li>{item}</li>" for item in items)
 
@@ -505,59 +533,11 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict, 
         </div>
         """
 
-    fig_num_map = {}
-    for img_id, item in extracted_images.items():
-        fnum = item.get("fig_num")
-        if fnum is not None:
-            fig_num_map.setdefault(fnum, []).append(img_id)
-
     figures_html = ""
-    used_img_ids = set()
-    for fig in summary.figures:
-        valid_img_objs = []
-        for raw_id in fig.image_ids:
-            clean_id = raw_id.split("(")[0].strip()
-            if clean_id in extracted_images and clean_id not in used_img_ids:
-                used_img_ids.add(clean_id)
-                valid_img_objs.append(extracted_images[clean_id])
-
-        if not valid_img_objs:
-            m_num = re.search(r"(\d+)", fig.figure_number)
-            if m_num:
-                fnum = int(m_num.group(1))
-                for cid in fig_num_map.get(fnum, []):
-                    if cid not in used_img_ids:
-                        used_img_ids.add(cid)
-                        valid_img_objs.append(extracted_images[cid])
-
+    for fig, valid_img_objs in resolve_figure_images(summary, extracted_images):
         figures_html += render_figure_card_html(
-            fig.figure_number, fig.case_diagnosis, valid_img_objs, fig.descriptions, is_pdf=is_pdf
+            fig.figure_number, fig.case_diagnosis, valid_img_objs, fig.descriptions
         )
-
-    # PDF일 때만 글자 크기와 여백을 촘촘하게 압축하여 페이지 수를 최소화
-    page_css = ""
-    if is_pdf:
-        page_css = """
-        @page { size: A4; margin: 10mm 9mm; }
-        body { font-size: 9.2pt; line-height: 1.48; padding: 0; }
-        .report-wrap { max-width: 100%; margin: 0; }
-        h1 { font-size: 14pt; padding-bottom: 4px; }
-        h2 { font-size: 11pt; padding: 4px 8px; margin-top: 14px; margin-bottom: 6px; }
-        h3 { font-size: 10pt; margin-top: 10px; }
-        .figure-card { padding: 8px; border-radius: 4px; }
-        .figure-desc { padding: 6px 8px 6px 20px; font-size: 8.8pt; line-height: 1.48; }
-        """
-    else:
-        page_css = """
-        @page { size: A4; margin: 11mm 10mm; }
-        body { font-size: 10pt; line-height: 1.55; padding: 12px; }
-        .report-wrap { max-width: 840px; margin: 0 auto; }
-        h1 { font-size: 15pt; padding-bottom: 6px; }
-        h2 { font-size: 11.5pt; padding: 6px 10px; margin-top: 18px; margin-bottom: 8px; }
-        h3 { font-size: 10.5pt; margin-top: 12px; }
-        .figure-card { padding: 10px; border-radius: 6px; }
-        .figure-desc { padding: 8px 10px 8px 22px; font-size: 9.5pt; line-height: 1.55; }
-        """
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -567,33 +547,35 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict, 
     <title>{summary.paper_title_ko}</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Nanum+Gothic:wght@400;700&display=swap');
+        @page {{ size: A4; margin: 11mm 10mm; }}
         body {{
             font-family: 'Nanum Gothic', 'Malgun Gothic', '맑은 고딕', -apple-system, sans-serif;
-            color: #1e293b; background-color: #ffffff;
+            font-size: 10pt; line-height: 1.55; color: #1e293b;
+            margin: 0; padding: 12px; background-color: #ffffff;
             -webkit-print-color-adjust: exact; print-color-adjust: exact;
         }}
-        {page_css}
-        h1 {{ color: #0f2c59; border-bottom: 2px solid #0f2c59; margin-top: 0; }}
-        h2 {{ color: #ffffff; background-color: #1e3a8a; }}
-        h3 {{ color: #1e3a8a; margin-bottom: 4px; border-left: 4px solid #1e3a8a; padding-left: 6px; }}
+        .report-wrap {{ max-width: 840px; margin: 0 auto; }}
+        h1 {{ font-size: 15pt; color: #0f2c59; border-bottom: 2px solid #0f2c59; padding-bottom: 6px; margin-top: 0; }}
+        h2 {{ font-size: 11.5pt; color: #ffffff; background-color: #1e3a8a; padding: 6px 10px; border-radius: 4px; margin-top: 18px; margin-bottom: 8px; }}
+        h3 {{ font-size: 10.5pt; color: #1e3a8a; margin-top: 12px; margin-bottom: 4px; border-left: 4px solid #1e3a8a; padding-left: 6px; }}
         ul {{ margin-top: 4px; margin-bottom: 10px; padding-left: 18px; }}
         li {{ margin-bottom: 6px; }}
         .table-scroll {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
         table {{ width: 100%; border-collapse: collapse; margin: 6px 0 12px 0; font-size: 9pt; }}
         th {{ background-color: #e2e8f0; color: #0f172a; font-weight: bold; border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }}
         td {{ border: 1px solid #cbd5e1; padding: 6px 8px; vertical-align: top; }}
-        .figure-card {{ border: 1px solid #cbd5e1; background-color: #f8fafc; break-inside: avoid; page-break-inside: avoid; }}
+        .figure-card {{ border: 1px solid #cbd5e1; border-radius: 6px; padding: 10px; margin-bottom: 14px; background-color: #f8fafc; break-inside: avoid; page-break-inside: avoid; }}
         .figure-title {{ font-size: 11pt; font-weight: bold; color: #0f2c59; background-color: #e2e8f0; border-left: 5px solid #1e3a8a; padding: 5px 10px; margin-bottom: 8px; border-radius: 2px; }}
         .diag-highlight {{ color: #1e3a8a; font-weight: bold; }}
-        .full-width-img {{ width: 100%; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; margin: 4px auto 8px auto; }}
+        .full-width-img {{ width: 100%; max-height: 680px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; margin: 4px auto 8px auto; }}
         .side-by-side-table {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; margin: 4px 0; }}
         .side-img-col {{ flex: 1 1 260px; text-align: center; }}
         .side-desc-col {{ flex: 1 1 260px; }}
-        .tall-single-img {{ width: 100%; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
+        .tall-single-img {{ width: 100%; max-height: 680px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
         .figure-grid {{ text-align: center; font-size: 0; margin: 4px 0 8px 0; width: 100%; }}
         .fig-cell {{ display: inline-block; vertical-align: top; box-sizing: border-box; padding: 2px; text-align: center; }}
-        .grid-fill-img {{ width: 100%; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
-        .figure-desc {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; margin: 0; }}
+        .grid-fill-img {{ width: 100%; max-height: 540px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
+        .figure-desc {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px 10px 8px 22px; margin: 0; font-size: 9.5pt; line-height: 1.55; }}
         @media (max-width: 600px) {{
             .fig-cell {{ width: 100% !important; display: block; }}
         }}
@@ -626,34 +608,117 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict, 
 </html>"""
 
 
-# =====================================================================
-# 6. Streamlit 클라우드 전용 PDF 구워내기 (xvfb 가상 디스플레이 적용)
-# =====================================================================
-def generate_pdf_from_html(html_content: str) -> bytes:
-    options = {
-        'page-size': 'A4',
-        'margin-top': '0mm',
-        'margin-right': '0mm',
-        'margin-bottom': '0mm',
-        'margin-left': '0mm',
-        'encoding': 'UTF-8',
-        'enable-local-file-access': '',
-        'no-outline': None,
-        'print-media-type': '',
-        'quiet': ''
-    }
+def generate_pdf_bytes_pymupdf(summary: PaperSummaryResult, extracted_images: dict) -> bytes:
+    """외부 리눅스 프로그램 없이 PyMuPDF 내장 Story 엔진으로 A4 PDF를 직접 생성합니다."""
+    tmpdir = tempfile.mkdtemp()
     try:
-        # Streamlit Cloud 리눅스 환경에서 X 서버 없이 렌더링하기 위한 가상 래퍼 설정
-        config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')
-        pdf_bytes = pdfkit.from_string(html_content, False, options=options, configuration=config)
-        return pdf_bytes
+        for img_id, item in extracted_images.items():
+            img_path = os.path.join(tmpdir, f"{img_id}.png")
+            with open(img_path, "wb") as f:
+                f.write(item["png_bytes"])
+
+        def render_list(items):
+            return "".join(f"<li>{item}</li>" for item in items)
+
+        tables_html = ""
+        for tbl in summary.tables:
+            headers_html = "".join(f"<th>{h}</th>" for h in tbl.headers)
+            rows_html = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in tbl.rows)
+            tables_html += f"""
+            <h3>{tbl.title}</h3>
+            <table>
+                <tr>{headers_html}</tr>
+                {rows_html}
+            </table>
+            """
+
+        figures_html = ""
+        for fig, valid_img_objs in resolve_figure_images(summary, extracted_images):
+            clean_num = fig.figure_number.strip().rstrip(":")
+            clean_diag = fig.case_diagnosis.strip()
+            header_text = f"{clean_num} : {clean_diag}" if clean_diag else clean_num
+            imgs_tag_html = ""
+            for item in valid_img_objs:
+                # A4 폭(535pt) 및 최대 높이(430pt) 안에 비율을 유지하며 맞춤
+                w_pt = 515.0
+                h_pt = round(w_pt / max(item["aspect"], 0.2), 1)
+                if h_pt > 430.0:
+                    h_pt = 430.0
+                    w_pt = round(h_pt * item["aspect"], 1)
+                imgs_tag_html += f'<p align="center"><img src="{item["id"]}.png" width="{w_pt}" height="{h_pt}"></p>'
+
+            desc_html = "".join(f"<li>{d}</li>" for d in fig.descriptions)
+            figures_html += f"""
+            <div class="fig-box">
+                <p class="fig-hdr"><b>{header_text}</b></p>
+                {imgs_tag_html}
+                <ul>{desc_html}</ul>
+            </div>
+            """
+
+        story_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+    body {{ font-family: sans-serif; font-size: 9.5pt; line-height: 1.45; color: #1e293b; }}
+    h1 {{ font-size: 14pt; color: #0f2c59; margin-bottom: 8pt; }}
+    h2 {{ font-size: 11pt; color: #ffffff; background-color: #1e3a8a; padding: 4pt 6pt; margin-top: 12pt; margin-bottom: 6pt; }}
+    h3 {{ font-size: 10pt; color: #1e3a8a; margin-top: 8pt; margin-bottom: 4pt; }}
+    ul {{ margin-top: 3pt; margin-bottom: 8pt; }}
+    li {{ margin-bottom: 4pt; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 4pt; margin-bottom: 10pt; font-size: 8.5pt; }}
+    th {{ background-color: #e2e8f0; color: #0f172a; font-weight: bold; border: 1px solid #94a3b8; padding: 4pt; text-align: left; }}
+    td {{ border: 1px solid #cbd5e1; padding: 4pt; vertical-align: top; }}
+    .fig-box {{ margin-top: 8pt; margin-bottom: 12pt; padding: 6pt; background-color: #f8fafc; border: 1px solid #cbd5e1; }}
+    .fig-hdr {{ font-size: 10.5pt; color: #0f2c59; background-color: #e2e8f0; padding: 4pt 6pt; margin-top: 0; margin-bottom: 6pt; }}
+</style>
+</head>
+<body>
+    <h1>{summary.paper_title_ko}</h1>
+    <h2>파트 1. 전체 핵심 요약 (Core Summary)</h2>
+    <h3>1) 질환 정의 및 임상적 특징</h3>
+    <ul>{render_list(summary.definition_and_clinical)}</ul>
+    <h3>2) 핵심 영상 소견 (Key Imaging Features)</h3>
+    <ul>{render_list(summary.key_imaging_features)}</ul>
+    <h3>3) 감별진단 (Differential Diagnosis)</h3>
+    <ul>{render_list(summary.differential_diagnosis)}</ul>
+    <h3>4) 판독 시 주의점 (Pitfalls) 및 치료 원칙</h3>
+    <ul>{render_list(summary.pitfalls_and_management)}</ul>
+    <h2>파트 2. 핵심 요약 표 (Summary Table)</h2>
+    {tables_html}
+    <h2>파트 3. 원본 Figure 이미지 및 캡션 전수 정리</h2>
+    {figures_html}
+</body>
+</html>"""
+
+        pdf_out_path = os.path.join(tmpdir, "output.pdf")
+        writer = fitz.DocumentWriter(pdf_out_path)
+        mediabox = fitz.paper_rect("a4")
+        where = mediabox + (28, 28, -28, -28)
+        story = fitz.Story(html=story_html, archive=fitz.Archive(tmpdir))
+
+        more = 1
+        page_guard = 0
+        while more and page_guard < 80:
+            page_guard += 1
+            device = writer.begin_page(mediabox)
+            more, _ = story.place(where)
+            story.draw(device)
+            writer.end_page()
+        writer.close()
+
+        with open(pdf_out_path, "rb") as f:
+            return f.read()
     except Exception as e:
-        print(f"PDF 생성 오류: {e}")
+        print(f"PyMuPDF PDF 생성 오류: {e}")
         return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # =====================================================================
-# 7. 모바일 & PC 반응형 웹 인터페이스 UI
+# 6. 모바일 & PC 반응형 웹 인터페이스 UI
 # =====================================================================
 st.set_page_config(
     page_title="영상의학 논문 한글 요약기",
@@ -673,7 +738,7 @@ st.markdown("""
 </style>
 <div class="main-banner">
     <h2>🏥 영상의학 논문 한글 요약기</h2>
-    <p>모식도·벡터·CT 무손실 캡처 · 모바일(HTML) & PC(PDF) 통합 저장</p>
+    <p>모식도·벡터·CT 무손실 캡처 · PDF 및 HTML 선택 다운로드</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -723,13 +788,9 @@ if uploaded_files:
                         prefix_tag = "[한글판프로]" if "pro" in used_model else "[한글판]"
                         base_name = os.path.splitext(up_file.name)[0]
 
-                        # 모바일 전용 뷰어용 HTML (넓고 시원한 여백)
-                        web_html = build_full_report_html(summary_result, extracted_images, is_pdf=False)
-                        
-                        # 인쇄·PC 보관용 압축 레이아웃 HTML을 만든 뒤 PDF로 굽기
-                        st.write("🖨️ A4 판독 레이아웃 PDF 파일 생성 중...")
-                        pdf_html = build_full_report_html(summary_result, extracted_images, is_pdf=True)
-                        pdf_out_bytes = generate_pdf_from_html(pdf_html)
+                        web_html = build_full_report_html(summary_result, extracted_images)
+                        st.write("🖨️ A4 PDF 파일 및 HTML 파일 동시 생성 중...")
+                        pdf_out_bytes = generate_pdf_bytes_pymupdf(summary_result, extracted_images)
 
                         st.session_state.results.append({
                             "title": summary_result.paper_title_ko,
@@ -751,24 +812,20 @@ if st.session_state.get("results"):
         st.subheader(f"📑 {res['title']}")
         st.caption(f"사용 모델: {res['used_model']} | 정밀 캡처된 Figure: {res['img_count']}개")
 
-        # 다운로드 버튼을 2개로 분리 (PDF용, HTML용)
         col1, col2 = st.columns(2)
         with col1:
             if res.get("pdf_bytes"):
                 st.download_button(
-                    label=f"📥 A4 판독 레이아웃 PDF로 저장하기 (.pdf)",
+                    label=f"📥 PDF 다운로드 ({res['pdf_name']})",
                     data=res["pdf_bytes"],
                     file_name=res["pdf_name"],
                     mime="application/pdf",
                     use_container_width=True,
                     key=f"dl_pdf_{i}",
                 )
-            else:
-                st.warning("⚠️ 서버 환경 문제로 PDF 변환에 실패했습니다. 우측 HTML을 다운로드해 주세요.")
-        
         with col2:
             st.download_button(
-                label=f"📱 스마트폰 뷰어 겸용 파일로 저장하기 (.html)",
+                label=f"📱 HTML 다운로드 ({res['html_name']})",
                 data=res["web_html"].encode("utf-8"),
                 file_name=res["html_name"],
                 mime="text/html",
@@ -776,5 +833,4 @@ if st.session_state.get("results"):
                 key=f"dl_html_{i}",
             )
 
-        # 화면에는 모바일 뷰어용(넓은 레이아웃)을 띄워줌
         components.html(res["web_html"], height=850, scrolling=True)
