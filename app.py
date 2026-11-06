@@ -2,9 +2,7 @@ import os
 import sys
 import re
 import json
-import time
 import base64
-import subprocess
 import types as _py_types
 import streamlit as st
 import streamlit.components.v1 as components
@@ -26,7 +24,7 @@ from pydantic import BaseModel, Field
 
 
 # =====================================================================
-# 1. 설정 및 API 키 관리 (클라우드 Secrets / 로컬 파일 / URL 파라미터 연동)
+# 1. 설정 및 API 키 관리
 # =====================================================================
 CONFIG_PATH = os.path.expanduser("~/.radiology_pdf_summarizer_cloud.json")
 
@@ -70,11 +68,11 @@ class TableData(BaseModel):
 class FigureSummary(BaseModel):
     figure_number: str = Field(description="Figure 번호만 깔끔하게 작성 (예: 'Figure 1', 'Figure 6', 'Figure 10')")
     case_diagnosis: str = Field(
-        description="이 Figure 전체가 보여주는 핵심 증례 진단명 1개. 반드시 '한글 진단명 (영문 진단명)' 형태로 작성"
+        description="이 Figure 전체가 보여주는 핵심 증례 진단명 또는 핵심 주제 1개. 반드시 '한글명 (영문명)' 형태로 작성"
     )
-    image_ids: list[str] = Field(description="해당 Figure에 매칭되는 추출 이미지 ID 리스트 (예: ['p1_img1'])")
+    image_ids: list[str] = Field(description="해당 Figure에 매칭되는 추출 이미지 ID 리스트 (예: ['p3_fig1'])")
     descriptions: list[str] = Field(
-        description="하위 항목별 설명. 반드시 '[Figure 번호] → [시퀀스/검사명] → [화살표·별표 등 지시 기호 소견 (해부학 명칭은 반드시 영문 병기)] → [의미/진단]' 구조로 작성"
+        description="하위 항목별 설명. 반드시 '[Figure 번호] → [시퀀스/검사명/모식도] → [화살표·별표 등 지시 기호 소견 (해부학 명칭은 반드시 영문 병기)] → [의미/진단]' 구조로 작성"
     )
 
 class PaperSummaryResult(BaseModel):
@@ -119,8 +117,254 @@ def build_fallback_model_chain(client: genai.Client, preferred_tier: str) -> lis
 
 
 # =====================================================================
-# 3. PDF 바이트에서 텍스트 및 Figure 이미지 추출
+# 3. [전면 개선] 모식도·벡터·표·CT 통합 Figure 영역 정밀 캡처 엔진
 # =====================================================================
+FIG_CAP_PATTERN = re.compile(
+    r"^\s*Fig(?:ure|\.)?\s*(?:(\d+)\s*[\.\:]|[A-Z][^\n]{5,}\([A-Z]\))",
+    re.IGNORECASE | re.DOTALL,
+)
+TABLE_BARRIER_PATTERN = re.compile(
+    r"^\s*(?:Table\s+\d+\s*[\.\:]|Note\.—|Note\.\s*-|Source\.—|Source\.\s*-|\*[A-Z])",
+    re.IGNORECASE,
+)
+SECTION_HEADER_PATTERN = re.compile(
+    r"^\s*(?:TEACHING POINTS|Introduction|History|Performance|Literature Review|Safety|Extracolonic Findings|Technique|Bowel Preparation|Colonic Distention|Interpretation and Reporting|Current Concepts|Polypectomy Strategy|Barriers to Implementation|Future Directions|Opportunistic Screening|Conclusion|References|Abstract|Materials and Methods|Results|Discussion)\s*$",
+    re.IGNORECASE,
+)
+
+
+def extract_figures_from_page_render(page: fitz.Page, page_num: int, xref_counts: dict, next_auto_fig: int) -> tuple[list[dict], int]:
+    """
+    페이지 내 Figure 캡션 및 이미지/벡터 도형 영역을 분석하여,
+    BioRender 모식도, 벡터 화살표, 내장 표, A/B/C 라벨이 깨지지 않도록
+    해당 Figure 영역 전체를 고해상도(200 DPI)로 통합 렌더링합니다.
+    """
+    pw, ph = page.rect.width, page.rect.height
+    top_limit = ph * 0.055
+    bot_limit = ph * 0.935
+
+    raw_blocks = page.get_text("blocks")
+    text_blocks = []
+    fig_captions = []
+    table_barriers = []
+    body_blocks = []
+
+    for b in raw_blocks:
+        if b[6] != 0:
+            continue
+        r = fitz.Rect(b[:4])
+        txt = b[4].strip()
+        if not txt:
+            continue
+
+        # 상하단 학술지 머리말/꼬리말 제외
+        if r.y1 <= ph * 0.062 or r.y0 >= ph * 0.932:
+            continue
+        if any(h in txt for h in ["radiographics.rsna.org", "October Special Issue", "Volume 46 Number", "This copy is for personal use"]):
+            continue
+
+        m_fig = FIG_CAP_PATTERN.match(txt)
+        if m_fig:
+            fnum = int(m_fig.group(1)) if m_fig.group(1) else next_auto_fig
+            next_auto_fig = max(next_auto_fig, fnum + 1)
+            fig_captions.append({"fig_num": fnum, "rect": r, "text": txt})
+            continue
+
+        if TABLE_BARRIER_PATTERN.match(txt):
+            table_barriers.append(r)
+            continue
+
+        # 본문 문단 판별 (긴 산문 문단 또는 섹션 제목)
+        if len(txt) >= 135 or SECTION_HEADER_PATTERN.match(txt):
+            body_blocks.append(r)
+        else:
+            text_blocks.append({"rect": r, "text": txt})
+
+    # Figure 캡션이 없는 페이지(표지 등)는 건너뜀
+    if not fig_captions:
+        return [], next_auto_fig
+
+    fig_captions.sort(key=lambda c: c["rect"].y0)
+
+    # 본문 문단과 나란히 배치된 짧은 본문 줄이나 마지막 캡션 아래의 본문 블록도 본문으로 분류
+    last_cap_y1 = max(c["rect"].y1 for c in fig_captions)
+    for tb in list(text_blocks):
+        r = tb["rect"]
+        txt = tb["text"]
+        if len(txt) >= 48 and (txt.endswith(".") or ")" in txt):
+            if r.y0 >= last_cap_y1 - 4:
+                body_blocks.append(r)
+                text_blocks.remove(tb)
+                continue
+            for bb in body_blocks:
+                if abs(r.x0 - bb.x0) < 25 and (abs(r.y0 - bb.y1) < 18 or abs(bb.y0 - r.y1) < 18):
+                    body_blocks.append(r)
+                    text_blocks.remove(tb)
+                    break
+
+    # Table 캡션/각주 주변의 표 내부 텍스트 블록도 보호 영역(Table Barrier)으로 확장
+    if table_barriers:
+        changed = True
+        while changed:
+            changed = False
+            tb_union = fitz.Rect(table_barriers[0])
+            for tr in table_barriers[1:]:
+                tb_union |= tr
+            for tb in list(text_blocks):
+                r = tb["rect"]
+                # 표 제목 위쪽(Table 1처럼 표가 위, 캡션이 아래인 경우) 또는 표 제목~각주 사이 텍스트
+                if (r.y1 <= tb_union.y1 + 15 and r.y0 >= top_limit and tb_union.y0 < ph * 0.45 and r.y1 <= tb_union.y0 + 5) or (
+                    r.y0 >= tb_union.y0 - 10 and r.y1 <= tb_union.y1 + 10
+                ):
+                    table_barriers.append(r)
+                    text_blocks.remove(tb)
+                    changed = True
+
+    # 페이지 내 유효 이미지 영역 수집
+    img_infos = page.get_image_info(xrefs=True)
+    valid_img_rects = []
+    for info in img_infos:
+        xref = info.get("xref", 0)
+        if xref and xref_counts.get(xref, 0) > 2:
+            continue
+        ir = fitz.Rect(info["bbox"]) & page.rect
+        if ir.is_empty or ir.width < 22 or ir.height < 22:
+            continue
+        if ir.y1 <= top_limit or ir.y0 >= bot_limit:
+            continue
+        if ir.width > pw * 0.96 and ir.height > ph * 0.92:
+            continue
+        valid_img_rects.append(ir)
+
+    # 페이지 내 유효 벡터 그래픽(선, 박스, 모식도 원, 화살표 등) 수집
+    valid_draw_rects = []
+    for d in page.get_drawings():
+        dr = fitz.Rect(d.get("rect", (0, 0, 0, 0))) & page.rect
+        if dr.is_empty:
+            continue
+        if dr.width < 3 and dr.height < 3:
+            continue
+        if dr.y1 <= top_limit or dr.y0 >= bot_limit:
+            continue
+        if dr.width > pw * 0.85 and dr.height < 4:
+            continue
+        if dr.width > pw * 0.94 and dr.height > ph * 0.90:
+            continue
+        # 본문이나 표 영역과 겹치는 장식 선은 제외
+        if any(dr.intersects(bb) for bb in body_blocks + table_barriers):
+            continue
+        valid_draw_rects.append(dr)
+
+    # 각 이미지를 해당 Figure 캡션에 배정
+    K = len(fig_captions)
+    assigned_imgs = {i: [] for i in range(K)}
+    for ir in valid_img_rects:
+        cy = (ir.y0 + ir.y1) / 2.0
+        assigned = False
+        for i in range(K - 1):
+            if cy < fig_captions[i]["rect"].y1:
+                assigned_imgs[i].append(ir)
+                assigned = True
+                break
+        if not assigned:
+            assigned_imgs[K - 1].append(ir)
+
+    # 각 Figure별 최종 캡처 영역(fig_rect) 계산
+    fig_zones = []
+    for i, cap in enumerate(fig_captions):
+        cap_r = cap["rect"]
+        imgs = assigned_imgs[i]
+
+        if imgs:
+            core_rect = fitz.Rect(imgs[0])
+            for ir in imgs[1:]:
+                core_rect |= ir
+        else:
+            # 순수 벡터로만 이루어진 Figure에 대한 폴백
+            above_draws = [dr for dr in valid_draw_rects if dr.y1 <= cap_r.y0 + 5]
+            if not above_draws:
+                continue
+            core_rect = fitz.Rect(above_draws[0])
+            for dr in above_draws[1:]:
+                core_rect |= dr
+
+        # 상한선(y_min) 및 하한선(y_max) 계산
+        y_min = top_limit
+        if i > 0:
+            y_min = max(y_min, fig_captions[i - 1]["rect"].y1 + 2)
+
+        for br in body_blocks + table_barriers:
+            if br.y1 <= core_rect.y0 + 6:
+                y_min = max(y_min, br.y1 + 2)
+
+        y_max = bot_limit
+        # 캡션이 그림 아래에 위치한 표준 레이아웃인 경우 캡션 위쪽까지만 포함
+        if cap_r.y0 >= core_rect.y1 - 12:
+            y_max = min(y_max, cap_r.y0 - 2)
+        else:
+            # 캡션이 그림 옆(L자형 배치)에 위치한 경우
+            if i + 1 < K:
+                y_max = min(y_max, fig_captions[i + 1]["rect"].y0 - 2)
+
+        for br in body_blocks + table_barriers:
+            if br.y0 >= core_rect.y1 - 6:
+                y_max = min(y_max, br.y0 - 2)
+
+        fig_rect = fitz.Rect(core_rect)
+
+        # [y_min, y_max] 범위 내의 모든 벡터 모식도(6A, 6D, 9, 10, 11 등)와 그림 내부 라벨을 통합
+        candidate_rects = []
+        for dr in valid_draw_rects:
+            if dr.y0 >= y_min - 2 and dr.y1 <= y_max + 2:
+                if not dr.intersects(cap_r):
+                    candidate_rects.append(dr)
+
+        for tb in text_blocks:
+            tr = tb["rect"]
+            if tr.y0 >= y_min - 2 and tr.y1 <= y_max + 2:
+                if not tr.intersects(cap_r) and not any(tr.intersects(bb) for bb in body_blocks + table_barriers):
+                    candidate_rects.append(tr)
+
+        for cr in candidate_rects:
+            fig_rect |= cr
+
+        # 여백 4pt 추가
+        fig_rect = fitz.Rect(
+            max(page.rect.x0 + 8, fig_rect.x0 - 4),
+            max(top_limit, fig_rect.y0 - 4),
+            min(page.rect.x1 - 8, fig_rect.x1 + 4),
+            min(bot_limit, fig_rect.y1 + 4),
+        )
+        fig_zones.append({"fig_num": cap["fig_num"], "rect": fig_rect, "cap_rect": cap_r})
+
+    # L자형 Figure 영역 내부에 영문 캡션이나 본문 블록이 걸쳐 있으면 흰색 박스로 깔끔하게 마스킹
+    for c in fig_captions:
+        cr = c["rect"] + (-1, -1, 1, 1)
+        page.draw_rect(cr, color=(1, 1, 1), fill=(1, 1, 1))
+    for bb in body_blocks + table_barriers:
+        br = bb + (-1, -1, 1, 1)
+        page.draw_rect(br, color=(1, 1, 1), fill=(1, 1, 1))
+
+    results = []
+    for zone in fig_zones:
+        fnum = zone["fig_num"]
+        frect = zone["rect"]
+        pix = page.get_pixmap(clip=frect, dpi=200, alpha=False)
+        png_bytes = pix.tobytes("png")
+        b64_str = base64.b64encode(png_bytes).decode("utf-8")
+        img_id = f"p{page_num}_fig{fnum}"
+        results.append({
+            "id": img_id,
+            "fig_num": fnum,
+            "data_uri": f"data:image/png;base64,{b64_str}",
+            "width": pix.width,
+            "height": pix.height,
+            "aspect": round(pix.width / max(pix.height, 1), 2),
+        })
+
+    return results, next_auto_fig
+
+
 def extract_text_and_figures_from_bytes(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     full_text_blocks = []
@@ -133,6 +377,7 @@ def extract_text_and_figures_from_bytes(pdf_bytes: bytes):
             xref_counts[xref] = xref_counts.get(xref, 0) + 1
 
     stop_text_extraction = False
+    next_auto_fig = 1
 
     for page_idx, page in enumerate(doc):
         page_num = page_idx + 1
@@ -143,32 +388,13 @@ def extract_text_and_figures_from_bytes(pdf_bytes: bytes):
             page_text = page_text[: ref_match.start()]
             stop_text_extraction = True
 
-        img_list = page.get_images(full=True)
+        # 텍스트를 먼저 추출한 뒤, 페이지에서 Figure 영역을 고해상도로 캡처
+        page_figs, next_auto_fig = extract_figures_from_page_render(page, page_num, xref_counts, next_auto_fig)
         page_image_ids = []
-        img_counter = 1
-
-        for img_info in img_list:
-            xref = img_info[0]
-            if xref_counts.get(xref, 0) > 1:
-                continue
-
-            base_img = doc.extract_image(xref)
-            width, height = base_img["width"], base_img["height"]
-            if width < 160 or height < 120 or (width / height > 5.0):
-                continue
-
-            img_ext = base_img["ext"]
-            img_id = f"p{page_num}_img{img_counter}"
-            b64_str = base64.b64encode(base_img["image"]).decode("utf-8")
-
-            extracted_images[img_id] = {
-                "data_uri": f"data:image/{img_ext};base64,{b64_str}",
-                "width": width,
-                "height": height,
-                "aspect": round(width / height, 2)
-            }
-            page_image_ids.append(f"{img_id}({width}x{height})")
-            img_counter += 1
+        for item in page_figs:
+            img_id = item["id"]
+            extracted_images[img_id] = item
+            page_image_ids.append(f"{img_id}(Figure {item['fig_num']}: {item['width']}x{item['height']})")
 
         img_marker = f"\n[이 페이지에서 추출된 원본 Figure 이미지 ID 목록: {', '.join(page_image_ids)}]\n" if page_image_ids else ""
         full_text_blocks.append(f"--- [Page {page_num}] ---{img_marker}{page_text}")
@@ -189,16 +415,16 @@ def summarize_with_gemini(client: genai.Client, model_chain: list[str], extracte
 
 [절대 준수 작성 규칙]
 1. 해부학(Anatomy) 및 의학용어 원칙 (가장 중요!):
-   - 뼈, 관절, 혈관(동맥·정맥), 신경, 근육, 인대, 힘줄 등 모든 해부학 명칭은 절대로 한글만 단독으로 쓰지 말 것!
-   - 반드시 영문 원어를 그대로 쓰거나, 한글(영문) 형태로 매번 병기(예: 원위 척골동맥(distal ulnar artery), 갈고리뼈 갈고리(hook of hamate))할 것.
-   - 영상 시퀀스(T1WI, T2WI, FS, PDWI, DWI, ADC, Doppler US, CTA, MRA, DSA 등)도 실제 판독문 스타일로 영문을 적극 병기할 것.
+   - 뼈, 관절, 혈관(동맥·정맥), 신경, 근육, 인대, 힘줄, 장기 등 모든 해부학 명칭은 절대로 한글만 단독으로 쓰지 말 것!
+   - 반드시 영문 원어를 그대로 쓰거나, 한글(영문) 형태로 매번 병기(예: 회맹판(ileocecal valve), 무경성 톱니상 병변(sessile serrated lesion, SSL))할 것.
+   - 영상 시퀀스(T1WI, T2WI, FS, PDWI, DWI, ADC, Doppler US, CTA, MRA, CTC, MIP 등)도 실제 판독문 스타일로 영문을 적극 병기할 것.
 2. 파트 1 (전체 핵심 요약): 질환 정의, 임상적 특징, 핵심 영상 소견(Key Imaging Features), 감별진단(DDx), 판독 시 주의점(Pitfalls)만 개조식으로 압축할 것.
-3. 파트 2 (핵심 표): 본문 주요 표 번역 또는 주요 감별진단(DDx) 비교 요약 표 1개로 구성할 것.
+3. 파트 2 (핵심 표): 본문 주요 표 번역 또는 주요 감별진단(DDx) 비교 요약 표로 구성할 것.
 4. 파트 3 (Figure 제목 진단명 표기 및 캡션 전수 정리):
-   - 모든 Figure를 번호 순서대로 정리할 것.
-   - `figure_number`에는 'Figure 1'처럼 번호만 적고, `case_diagnosis`에는 해당 Figure의 핵심 진단명 딱 1개를 '한글 진단명 (English Diagnosis)' 형태로 명확히 작성할 것!
-   - '[이 페이지에서 추출된 원본 Figure 이미지 ID 목록: ...]'을 참고하여 순수 ID(예: 'p1_img1')만 빠짐없이 image_ids 리스트에 넣을 것.
-   - 각 설명(`descriptions`)은 '[Figure 하위번호] → [시퀀스/단면/검사명] → [화살표·별표 지시 해부학 위치(영문 병기 필수) 및 영상 소견] → [의미/진단]' 구조로 작성할 것.
+   - 모든 Figure를 번호 순서대로 빠짐없이 정리할 것.
+   - `figure_number`에는 'Figure 1', 'Figure 2'처럼 번호만 적고, `case_diagnosis`에는 해당 Figure의 핵심 진단명 또는 핵심 주제를 '한글명 (English Title)' 형태로 명확히 작성할 것!
+   - '[이 페이지에서 추출된 원본 Figure 이미지 ID 목록: ...]'을 참고하여 순수 ID(예: 'p3_fig1')만 정확히 image_ids 리스트에 넣을 것.
+   - 각 설명(`descriptions`)은 '[Figure 하위번호] → [시퀀스/단면/검사명 또는 모식도] → [화살표·원·별표 지시 해부학 위치(영문 병기 필수) 및 핵심 소견] → [의미/진단]' 구조로 상세히 작성할 것.
 
 [논문 원문 텍스트]
 {extracted_text}
@@ -237,7 +463,7 @@ def render_figure_card_html(fig_num: str, diagnosis: str, img_objs: list[dict], 
         </div>
         """
 
-    if count == 1 and img_objs[0]["aspect"] <= 0.88:
+    if count == 1 and img_objs[0]["aspect"] <= 0.85:
         tall_img = img_objs[0]
         return f"""
         <div class="figure-card">
@@ -300,24 +526,35 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict) 
         </div>
         """
 
+    # Figure 번호 기반 자동 매칭 맵
+    fig_num_map = {}
+    for img_id, item in extracted_images.items():
+        fnum = item.get("fig_num")
+        if fnum is not None:
+            fig_num_map.setdefault(fnum, []).append(img_id)
+
     figures_html = ""
     used_img_ids = set()
     for fig in summary.figures:
         valid_img_objs = []
         for raw_id in fig.image_ids:
             clean_id = raw_id.split("(")[0].strip()
-            if clean_id in extracted_images:
+            if clean_id in extracted_images and clean_id not in used_img_ids:
                 used_img_ids.add(clean_id)
                 valid_img_objs.append(extracted_images[clean_id])
 
+        # 만약 AI가 image_id를 누락했더라도 Figure 번호가 일치하면 자동 연결
+        if not valid_img_objs:
+            m_num = re.search(r"(\d+)", fig.figure_number)
+            if m_num:
+                fnum = int(m_num.group(1))
+                for cid in fig_num_map.get(fnum, []):
+                    if cid not in used_img_ids:
+                        used_img_ids.add(cid)
+                        valid_img_objs.append(extracted_images[cid])
+
         figures_html += render_figure_card_html(
             fig.figure_number, fig.case_diagnosis, valid_img_objs, fig.descriptions
-        )
-
-    unmatched_objs = [extracted_images[k] for k in extracted_images.keys() if k not in used_img_ids]
-    if unmatched_objs:
-        figures_html += render_figure_card_html(
-            "추가 추출 이미지", "Additional Figures", unmatched_objs, ["본문 자동 매칭 외 추가 이미지입니다."]
         )
 
     return f"""<!DOCTYPE html>
@@ -348,14 +585,14 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict) 
         .figure-card {{ border: 1px solid #cbd5e1; border-radius: 6px; padding: 10px; margin-bottom: 14px; background-color: #f8fafc; break-inside: avoid; page-break-inside: avoid; }}
         .figure-title {{ font-size: 11pt; font-weight: bold; color: #0f2c59; background-color: #e2e8f0; border-left: 5px solid #1e3a8a; padding: 5px 10px; margin-bottom: 8px; border-radius: 2px; }}
         .diag-highlight {{ color: #1e3a8a; font-weight: bold; }}
-        .full-width-img {{ width: 100%; max-height: 600px; height: auto; object-fit: contain; border: 1px solid #94a3b8; border-radius: 4px; background: #000; display: block; margin: 4px auto 8px auto; }}
+        .full-width-img {{ width: 100%; max-height: 680px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; margin: 4px auto 8px auto; }}
         .side-by-side-table {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; margin: 4px 0; }}
         .side-img-col {{ flex: 1 1 260px; text-align: center; }}
         .side-desc-col {{ flex: 1 1 260px; }}
-        .tall-single-img {{ width: 100%; max-height: 660px; height: auto; object-fit: contain; border: 1px solid #94a3b8; border-radius: 4px; background: #000; display: block; }}
+        .tall-single-img {{ width: 100%; max-height: 680px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
         .figure-grid {{ text-align: center; font-size: 0; margin: 4px 0 8px 0; width: 100%; }}
         .fig-cell {{ display: inline-block; vertical-align: top; box-sizing: border-box; padding: 2px; text-align: center; }}
-        .grid-fill-img {{ width: 100%; max-height: 520px; height: auto; object-fit: contain; border: 1px solid #94a3b8; border-radius: 4px; background: #000; display: block; }}
+        .grid-fill-img {{ width: 100%; max-height: 540px; height: auto; object-fit: contain; border: 1px solid #cbd5e1; border-radius: 4px; background: #ffffff; display: block; }}
         .figure-desc {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px 10px 8px 22px; margin: 0; font-size: 9.5pt; line-height: 1.55; }}
         @media (max-width: 600px) {{
             .fig-cell {{ width: 100% !important; display: block; }}
@@ -389,14 +626,6 @@ def build_full_report_html(summary: PaperSummaryResult, extracted_images: dict) 
 </html>"""
 
 
-def try_generate_pdf_bytes(full_html: str):
-    try:
-        import weasyprint
-        return weasyprint.HTML(string=full_html).write_pdf()
-    except Exception:
-        return None
-
-
 # =====================================================================
 # 5. Streamlit 모바일 & PC 반응형 웹 인터페이스
 # =====================================================================
@@ -418,7 +647,7 @@ st.markdown("""
 </style>
 <div class="main-banner">
     <h2>🏥 영상의학 논문 한글 요약기</h2>
-    <p>Figure 진단명 자동 표기 · 해부학 영문 병기 · 24시간 클라우드 웹앱</p>
+    <p>모식도·벡터·CT 무손실 캡처 · 진단명 자동 표기 · 해부학 영문 병기</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -431,7 +660,7 @@ with st.expander("🔑 Gemini API 키 설정 (최초 1회 저장)", expanded=not
         if key_input.strip():
             st.session_state.api_key = key_input.strip()
             save_api_key_local(st.session_state.api_key)
-            st.success("✅ API 키가 저장되었습니다! 현재 주소를 북마크하거나 [홈 화면에 추가]하면 계속 유지됩니다.")
+            st.success("✅ API 키가 저장되었습니다!")
         else:
             st.warning("API 키를 입력해 주세요.")
 
@@ -442,9 +671,9 @@ tier_choice = st.radio(
     horizontal=True,
 )
 
+# 모바일 브라우저 파일 선택 비활성화 방지를 위해 type 제한 제거
 uploaded_files = st.file_uploader(
     "📄 요약할 영문 영상의학 PDF 논문을 선택하세요 (여러 개 동시 선택 가능)",
-    type=["pdf"],
     accept_multiple_files=True,
 )
 
@@ -461,24 +690,21 @@ if uploaded_files:
                 with st.status(f"[{idx}/{len(uploaded_files)}] 📄 {up_file.name} 분석 및 요약 중...", expanded=True) as status:
                     try:
                         pdf_bytes = up_file.read()
-                        st.write("🔍 원본 본문 텍스트 및 Figure 이미지 추출 중...")
+                        st.write("🔍 원본 본문 및 Figure(모식도·표·CT) 고해상도 통합 캡처 중...")
                         extracted_text, extracted_images = extract_text_and_figures_from_bytes(pdf_bytes)
-                        st.write(f"✅ Figure 이미지 {len(extracted_images)}개 추출 완료! AI 요약 생성 중...")
+                        st.write(f"✅ 총 {len(extracted_images)}개 Figure 정밀 캡처 완료! AI 요약 생성 중...")
 
                         summary_result, used_model = summarize_with_gemini(client, model_chain, extracted_text)
                         prefix_tag = "[한글판프로]" if "pro" in used_model else "[한글판]"
                         base_name = os.path.splitext(up_file.name)[0]
 
                         full_html = build_full_report_html(summary_result, extracted_images)
-                        pdf_out = try_generate_pdf_bytes(full_html)
 
                         st.session_state.results.append({
                             "title": summary_result.paper_title_ko,
                             "used_model": used_model,
                             "img_count": len(extracted_images),
                             "html": full_html,
-                            "pdf_bytes": pdf_out,
-                            "pdf_name": f"{prefix_tag} {base_name}.pdf",
                             "html_name": f"{prefix_tag} {base_name}.html",
                         })
                         status.update(label=f"✅ [{used_model}] {up_file.name} 변환 완료!", state="complete", expanded=False)
@@ -490,37 +716,15 @@ if st.session_state.get("results"):
     st.divider()
     for i, res in enumerate(st.session_state.results):
         st.subheader(f"📑 {res['title']}")
-        st.caption(f"사용 모델: {res['used_model']} | 추출된 Figure 이미지: {res['img_count']}개")
+        st.caption(f"사용 모델: {res['used_model']} | 정밀 캡처된 Figure: {res['img_count']}개")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if res["pdf_bytes"]:
-                st.download_button(
-                    label=f"📥 {res['pdf_name']} 저장",
-                    data=res["pdf_bytes"],
-                    file_name=res["pdf_name"],
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key=f"dl_pdf_{i}",
-                )
-            else:
-                st.download_button(
-                    label=f"📥 {res['html_name']} 저장 (단독 실행 파일)",
-                    data=res["html"].encode("utf-8"),
-                    file_name=res["html_name"],
-                    mime="text/html",
-                    use_container_width=True,
-                    key=f"dl_html_{i}",
-                )
-        with col2:
-            if res["pdf_bytes"]:
-                st.download_button(
-                    label=f"📱 모바일 뷰어 파일(.html) 저장",
-                    data=res["html"].encode("utf-8"),
-                    file_name=res["html_name"],
-                    mime="text/html",
-                    use_container_width=True,
-                    key=f"dl_html_sub_{i}",
-                )
+        st.download_button(
+            label=f"📥 {res['html_name']} 다운로드 (PC & 스마트폰 겸용 파일)",
+            data=res["html"].encode("utf-8"),
+            file_name=res["html_name"],
+            mime="text/html",
+            use_container_width=True,
+            key=f"dl_html_{i}",
+        )
 
         components.html(res["html"], height=850, scrolling=True)
